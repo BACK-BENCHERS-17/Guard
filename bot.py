@@ -2,7 +2,7 @@
 """
 Telegram Channel Guard & Message Purge Bot
 Built for Python 3.10 - 3.14+ (Render / VPS Compatible)
-Direct MTProto Raw Entity Serialization for Custom Emojis & Button Icons
+Direct Custom Emojis & Layer-Safe Button Factory Engine
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ except RuntimeError:
 
 import aiosqlite
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle, raw
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import (
     ChannelInvalid,
@@ -50,7 +50,7 @@ from pyrogram.types import (
 )
 
 # ---------------------------------------------------------------------------
-# CUSTOM PREMIUM EMOJI CONSTANTS (Provided IDs)
+# CUSTOM PREMIUM EMOJI CONSTANTS (Strict Numerical IDs)
 # ---------------------------------------------------------------------------
 ICON_CHECK = 5985596818912712352
 ICON_CROSS = 5985346521103604145
@@ -78,7 +78,7 @@ ICON_INBOX = 5776182936638329359
 ICON_PIN = 5796440171364749940
 ICON_USER = 5258011929993026890
 
-# Pre-compiled text tokens with valid emoji fallbacks
+# Standard Text Tokens with Valid Unicode Fallbacks
 TG_CHECK = f'<tg-emoji emoji-id="{ICON_CHECK}">✅</tg-emoji>'
 TG_CROSS = f'<tg-emoji emoji-id="{ICON_CROSS}">❌</tg-emoji>'
 TG_WARN = f'<tg-emoji emoji-id="{ICON_WARN}">⚠️</tg-emoji>'
@@ -101,6 +101,51 @@ TG_OUTBOX = f'<tg-emoji emoji-id="{ICON_OUTBOX}">📤</tg-emoji>'
 TG_INBOX = f'<tg-emoji emoji-id="{ICON_INBOX}">📥</tg-emoji>'
 TG_PIN = f'<tg-emoji emoji-id="{ICON_PIN}">📌</tg-emoji>'
 TG_USER = f'<tg-emoji emoji-id="{ICON_USER}">👤</tg-emoji>'
+
+# ---------------------------------------------------------------------------
+# BUTTON FACTORY: NATIVE CUSTOM EMOJI & COLOR RENDERING
+# ---------------------------------------------------------------------------
+
+
+def make_btn(
+    text: str,
+    callback_data: Optional[str] = None,
+    url: Optional[str] = None,
+    icon_custom_emoji_id: Optional[int] = None,
+    style: str = "primary",  # primary (blue), success (green), danger (red)
+) -> InlineKeyboardButton:
+    """Creates a high-compatibility button with layer injection and fallback safety."""
+    color_map = {
+        "primary": "🔵",
+        "success": "🟢",
+        "danger": "🔴",
+    }
+    prefix = color_map.get(style, "")
+    display_text = f"{prefix} {text}".strip()
+
+    kwargs: Dict[str, Any] = {"text": display_text}
+    if callback_data:
+        kwargs["callback_data"] = callback_data
+    if url:
+        kwargs["url"] = url
+
+    # Try custom emoji icon & style kwarg injection
+    if icon_custom_emoji_id is not None:
+        kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+    if style:
+        kwargs["style"] = style
+
+    try:
+        return InlineKeyboardButton(**kwargs)
+    except TypeError:
+        # If running on stock Pyrogram that rejects style/custom_emoji args
+        kwargs.pop("style", None)
+        try:
+            return InlineKeyboardButton(**kwargs)
+        except TypeError:
+            kwargs.pop("icon_custom_emoji_id", None)
+            return InlineKeyboardButton(**kwargs)
+
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION & ENVIRONMENT
@@ -164,39 +209,6 @@ DEFAULT_BUTTONS_JSON = json.dumps(
 USER_STATES: Dict[int, Dict[str, Any]] = {}
 CHANNELS_PER_PAGE = 5
 BOT_USERNAME: str = ""
-
-# ---------------------------------------------------------------------------
-# RAW MTPROTO CUSTOM EMOJI & BUTTON SERIALIZATION
-# ---------------------------------------------------------------------------
-
-
-def make_btn(
-    text: str,
-    callback_data: Optional[str] = None,
-    url: Optional[str] = None,
-    icon_custom_emoji_id: Optional[int] = None,
-    color_prefix: str = "",
-) -> InlineKeyboardButton:
-    """
-    Creates buttons with custom icon tags and clear visual styling indicators
-    that survive standard Bot API limits and Telegram client rendering.
-    """
-    display_text = f"{color_prefix} {text}".strip() if color_prefix else text
-
-    kwargs: Dict[str, Any] = {"text": display_text}
-    if callback_data:
-        kwargs["callback_data"] = callback_data
-    if url:
-        kwargs["url"] = url
-
-    # Forward icon_custom_emoji_id if supported by the installed client build
-    if icon_custom_emoji_id is not None:
-        try:
-            return InlineKeyboardButton(icon_custom_emoji_id=icon_custom_emoji_id, **kwargs)
-        except TypeError:
-            pass
-    return InlineKeyboardButton(**kwargs)
-
 
 # ---------------------------------------------------------------------------
 # DATABASE SERVICE
@@ -374,7 +386,7 @@ class Database:
 db = Database(DATABASE_PATH)
 
 # ---------------------------------------------------------------------------
-# STRICT 4-WAY PERMISSION AUDIT & ACCESS
+# STRICT 4-WAY PERMISSION AUDIT & ACCESS VERIFICATION
 # ---------------------------------------------------------------------------
 
 
@@ -385,6 +397,7 @@ def is_admin(user_id: int) -> bool:
 async def check_channel_permissions(
     client: Client, channel_id: int
 ) -> Tuple[bool, bool, Dict[str, bool], str]:
+    """Requires all 4 rights: can_post_messages, can_edit_messages, can_delete_messages, can_invite_users."""
     perms = {"post": False, "edit": False, "delete": False, "invite": False}
     try:
         member: ChatMember = await client.get_chat_member(channel_id, "me")
@@ -518,7 +531,7 @@ def parse_buttons(raw_json: Optional[str]) -> Optional[InlineKeyboardMarkup]:
                             text=btn["text"],
                             url=btn["url"],
                             icon_custom_emoji_id=ICON_GLOBE,
-                            color_prefix="🌐",
+                            style="primary",
                         )
                     )
             if button_row:
@@ -540,24 +553,25 @@ async def safe_edit_message(
 
 
 # ---------------------------------------------------------------------------
-# INTERFACE KEYBOARDS (COLOR ACCENTED & ALIGNED)
+# INTERFACE KEYBOARDS (REORGANIZED & STRUCTURED)
 # ---------------------------------------------------------------------------
 
 
 def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
+    """Home screen: Balanced, uncluttered, with strict admin separation."""
     rows = [
         [
             make_btn(
                 text="My Channels",
                 callback_data="channels_page_my_1",
                 icon_custom_emoji_id=ICON_FOLDER,
-                color_prefix="📁",
+                style="primary",
             ),
             make_btn(
                 text="Link Channel",
                 callback_data="prompt_add_channel",
                 icon_custom_emoji_id=ICON_KEY,
-                color_prefix="🔑",
+                style="primary",
             ),
         ],
         [
@@ -565,13 +579,13 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
                 text="How It Works",
                 callback_data="nav_how_it_works",
                 icon_custom_emoji_id=ICON_DOC,
-                color_prefix="📄",
+                style="primary",
             ),
             make_btn(
                 text="Support Hub",
                 url=SUPPORT_URL,
                 icon_custom_emoji_id=ICON_GLOBE,
-                color_prefix="💬",
+                style="primary",
             ),
         ],
     ]
@@ -583,13 +597,13 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
                     text="Global Channels",
                     callback_data="channels_page_all_1",
                     icon_custom_emoji_id=ICON_GLOBE,
-                    color_prefix="🌐",
+                    style="primary",
                 ),
                 make_btn(
                     text="System Status",
                     callback_data="nav_status",
                     icon_custom_emoji_id=ICON_STATS,
-                    color_prefix="📊",
+                    style="primary",
                 ),
             ]
         )
@@ -599,7 +613,7 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
                     text="Admin Suite",
                     callback_data="cmd_admin",
                     icon_custom_emoji_id=ICON_CROWN,
-                    color_prefix="👑",
+                    style="primary",
                 )
             ]
         )
@@ -607,6 +621,7 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
 
 
 def get_link_channel_menu_keyboard() -> InlineKeyboardMarkup:
+    """Inside Link Channel: Protect Channel button is placed cleanly here."""
     protect_url = (
         f"https://t.me/{BOT_USERNAME}?startchannel=true&admin=post_messages+edit_messages+delete_messages+invite_users"
     )
@@ -614,10 +629,10 @@ def get_link_channel_menu_keyboard() -> InlineKeyboardMarkup:
         [
             [
                 make_btn(
-                    text="Protect Channel (One-Click)",
+                    text="Protect Channel (One-Click Setup)",
                     url=protect_url,
                     icon_custom_emoji_id=ICON_SHIELD,
-                    color_prefix="🛡️",
+                    style="success",
                 )
             ],
             [
@@ -625,7 +640,7 @@ def get_link_channel_menu_keyboard() -> InlineKeyboardMarkup:
                     text="Back to Menu",
                     callback_data="nav_home",
                     icon_custom_emoji_id=ICON_BACK,
-                    color_prefix="⬅️",
+                    style="danger",
                 )
             ],
         ]
@@ -651,11 +666,12 @@ def build_channel_pagination_keyboard(
                     text=f"{ch['channel_title']}",
                     callback_data=f"view_channel_{ch['channel_id']}_{scope}_{page}",
                     icon_custom_emoji_id=ICON_FOLDER,
-                    color_prefix="🔹",
+                    style="primary",
                 )
             ]
         )
 
+    # Dynamic Navigation Row
     nav_row: List[InlineKeyboardButton] = []
     if page > 1:
         nav_row.append(
@@ -663,7 +679,7 @@ def build_channel_pagination_keyboard(
                 text="Prev",
                 callback_data=f"channels_page_{scope}_{page - 1}",
                 icon_custom_emoji_id=ICON_BACK,
-                color_prefix="⬅️",
+                style="primary",
             )
         )
     nav_row.append(
@@ -671,7 +687,7 @@ def build_channel_pagination_keyboard(
             text=f"{page}/{total_pages}",
             callback_data=f"channels_page_{scope}_{page}",
             icon_custom_emoji_id=ICON_STATS,
-            color_prefix="📑",
+            style="primary",
         )
     )
     if page < total_pages:
@@ -680,7 +696,7 @@ def build_channel_pagination_keyboard(
                 text="Next",
                 callback_data=f"channels_page_{scope}_{page + 1}",
                 icon_custom_emoji_id=ICON_NEXT,
-                color_prefix="➡️",
+                style="primary",
             )
         )
 
@@ -691,13 +707,13 @@ def build_channel_pagination_keyboard(
                 text="Refresh",
                 callback_data=f"channels_page_{scope}_{page}",
                 icon_custom_emoji_id=ICON_REFRESH,
-                color_prefix="🔄",
+                style="primary",
             ),
             make_btn(
                 text="Main Menu",
                 callback_data="nav_home",
                 icon_custom_emoji_id=ICON_BACK,
-                color_prefix="🏠",
+                style="danger",
             ),
         ]
     )
@@ -712,14 +728,14 @@ def get_channel_management_panel(
             text="Auto-Delete: ON",
             callback_data=f"toggle_ad_off_{channel_id}_{scope}_{page}",
             icon_custom_emoji_id=ICON_CHECK,
-            color_prefix="🟢",
+            style="success",
         )
     else:
         ad_btn = make_btn(
             text="Auto-Delete: OFF",
             callback_data=f"toggle_ad_on_{channel_id}_{scope}_{page}",
             icon_custom_emoji_id=ICON_CROSS,
-            color_prefix="🔴",
+            style="danger",
         )
 
     return InlineKeyboardMarkup(
@@ -730,13 +746,13 @@ def get_channel_management_panel(
                     text="Refresh Status",
                     callback_data=f"view_channel_{channel_id}_{scope}_{page}",
                     icon_custom_emoji_id=ICON_REFRESH,
-                    color_prefix="🔄",
+                    style="primary",
                 ),
                 make_btn(
                     text="Channel List",
                     callback_data=f"channels_page_{scope}_{page}",
                     icon_custom_emoji_id=ICON_BACK,
-                    color_prefix="⬅️",
+                    style="primary",
                 ),
             ],
             [
@@ -744,7 +760,7 @@ def get_channel_management_panel(
                     text="Support Hub",
                     url=SUPPORT_URL,
                     icon_custom_emoji_id=ICON_GLOBE,
-                    color_prefix="💬",
+                    style="primary",
                 )
             ],
         ]
@@ -759,13 +775,13 @@ def get_admin_suite_keyboard() -> InlineKeyboardMarkup:
                     text="Channel Broadcast",
                     callback_data="bc_menu_channels",
                     icon_custom_emoji_id=ICON_MEGAPHONE,
-                    color_prefix="📢",
+                    style="primary",
                 ),
                 make_btn(
                     text="User Broadcast",
                     callback_data="bc_menu_users",
                     icon_custom_emoji_id=ICON_USERS,
-                    color_prefix="👤",
+                    style="primary",
                 ),
             ],
             [
@@ -773,7 +789,7 @@ def get_admin_suite_keyboard() -> InlineKeyboardMarkup:
                     text="Global Broadcast (All)",
                     callback_data="bc_menu_global",
                     icon_custom_emoji_id=ICON_GLOBE,
-                    color_prefix="🌐",
+                    style="primary",
                 )
             ],
             [
@@ -781,13 +797,13 @@ def get_admin_suite_keyboard() -> InlineKeyboardMarkup:
                     text="Global Channels",
                     callback_data="channels_page_all_1",
                     icon_custom_emoji_id=ICON_FOLDER,
-                    color_prefix="📁",
+                    style="primary",
                 ),
                 make_btn(
                     text="System Audit",
                     callback_data="nav_status",
                     icon_custom_emoji_id=ICON_STATS,
-                    color_prefix="📊",
+                    style="primary",
                 ),
             ],
             [
@@ -795,13 +811,13 @@ def get_admin_suite_keyboard() -> InlineKeyboardMarkup:
                     text="Support Hub",
                     url=SUPPORT_URL,
                     icon_custom_emoji_id=ICON_GLOBE,
-                    color_prefix="💬",
+                    style="primary",
                 ),
                 make_btn(
                     text="Main Menu",
                     callback_data="nav_home",
                     icon_custom_emoji_id=ICON_BACK,
-                    color_prefix="🏠",
+                    style="danger",
                 ),
             ],
         ]
@@ -868,7 +884,7 @@ async def on_join_request(client: Client, request: ChatJoinRequest) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AUTO-DELETE ENGINE (STRICT 4-WAY REQUIRED PERMISSIONS)
+# AUTO-DELETE ENGINE (STRICT 4-WAY REQUIRED RIGHTS)
 # ---------------------------------------------------------------------------
 
 
@@ -965,7 +981,7 @@ async def cmd_admin_handler(client: Client, message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FORWARDED POST CHANNEL LINKING & INTERACTIVE BROADCASTING
+# FORWARDED CHANNEL LINKING & BROADCAST DELIVERY
 # ---------------------------------------------------------------------------
 
 
@@ -1000,7 +1016,7 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
     state = USER_STATES.get(user_id, {})
     action = state.get("action")
 
-    # Link Channel via Forwarded Message or Manual Input
+    # Channel Linking via Forwarded Post or @Username / ID
     if action == "manual_add_channel" or message.forward_from_chat:
         target_chat_id: Optional[Union[int, str]] = None
         target_chat_title: Optional[str] = None
@@ -1178,7 +1194,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="My Channels",
                         callback_data="channels_page_my_1",
                         icon_custom_emoji_id=ICON_FOLDER,
-                        color_prefix="📁",
+                        style="primary",
                     )
                 ],
                 [
@@ -1186,13 +1202,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Support Hub",
                         url=SUPPORT_URL,
                         icon_custom_emoji_id=ICON_GLOBE,
-                        color_prefix="💬",
+                        style="primary",
                     ),
                     make_btn(
                         text="Back",
                         callback_data="nav_home",
                         icon_custom_emoji_id=ICON_BACK,
-                        color_prefix="⬅️",
+                        style="danger",
                     ),
                 ],
             ]
@@ -1237,7 +1253,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                             text="Protect Channel",
                             url=protect_url,
                             icon_custom_emoji_id=ICON_SHIELD,
-                            color_prefix="🛡️",
+                            style="success",
                         )
                     ],
                     [
@@ -1245,7 +1261,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                             text="Link Channel",
                             callback_data="prompt_add_channel",
                             icon_custom_emoji_id=ICON_KEY,
-                            color_prefix="🔑",
+                            style="primary",
                         )
                     ],
                     [
@@ -1253,13 +1269,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                             text="Check Again",
                             callback_data=f"channels_page_{scope}_1",
                             icon_custom_emoji_id=ICON_SEARCH,
-                            color_prefix="🔄",
+                            style="primary",
                         ),
                         make_btn(
                             text="Back",
                             callback_data="nav_home",
                             icon_custom_emoji_id=ICON_BACK,
-                            color_prefix="⬅️",
+                            style="danger",
                         ),
                     ],
                 ]
@@ -1318,7 +1334,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Refresh",
                         callback_data="nav_status",
                         icon_custom_emoji_id=ICON_REFRESH,
-                        color_prefix="🔄",
+                        style="primary",
                     )
                 ],
                 [
@@ -1326,7 +1342,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Back",
                         callback_data="nav_home",
                         icon_custom_emoji_id=ICON_BACK,
-                        color_prefix="⬅️",
+                        style="danger",
                     )
                 ],
             ]
@@ -1387,13 +1403,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Clean Copy",
                         callback_data="bc_opt_ch_clean",
                         icon_custom_emoji_id=ICON_OUTBOX,
-                        color_prefix="📤",
+                        style="primary",
                     ),
                     make_btn(
                         text="Post & Pin",
                         callback_data="bc_opt_ch_pin",
                         icon_custom_emoji_id=ICON_PIN,
-                        color_prefix="📌",
+                        style="primary",
                     ),
                 ],
                 [
@@ -1401,7 +1417,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Back",
                         callback_data="cmd_admin",
                         icon_custom_emoji_id=ICON_BACK,
-                        color_prefix="⬅️",
+                        style="danger",
                     )
                 ],
             ]
@@ -1428,13 +1444,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Clean Copy",
                         callback_data="bc_opt_usr_clean",
                         icon_custom_emoji_id=ICON_OUTBOX,
-                        color_prefix="📤",
+                        style="primary",
                     ),
                     make_btn(
                         text="Forwarded Post",
                         callback_data="bc_opt_usr_forward",
                         icon_custom_emoji_id=ICON_NEXT,
-                        color_prefix="➡️",
+                        style="primary",
                     ),
                 ],
                 [
@@ -1442,7 +1458,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Back",
                         callback_data="cmd_admin",
                         icon_custom_emoji_id=ICON_BACK,
-                        color_prefix="⬅️",
+                        style="danger",
                     )
                 ],
             ]
@@ -1456,7 +1472,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Access denied.", show_alert=True)
             return
         text = (
-            f"┌────── ˹ {TG_GLOBE} <b>ɢʟᴏʙᴀʟ ʙʀᴏᴀᴅᴄᴀsᴛ</b> ˼ ─── ⏤‌‌‌‌●\n"
+            f"┌────── ˹ {TG_GLOBE} <b>ɢʟᴏʙᴀʟ ʙʀᴏᴀᴅᴄᴀsᴛ</b> ˼ ─── ⏤‌‌●\n"
             f"┆\n"
             f"┆ ʙᴏᴛʜ ᴜsᴇʀs & ᴄʜᴀɴɴᴇʟs :\n"
             f"┆\n"
@@ -1469,13 +1485,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Clean Copy",
                         callback_data="bc_opt_glob_clean",
                         icon_custom_emoji_id=ICON_OUTBOX,
-                        color_prefix="📤",
+                        style="primary",
                     ),
                     make_btn(
                         text="Forwarded Post",
                         callback_data="bc_opt_glob_forward",
                         icon_custom_emoji_id=ICON_NEXT,
-                        color_prefix="➡️️",
+                        style="primary",
                     ),
                 ],
                 [
@@ -1483,7 +1499,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         text="Back",
                         callback_data="cmd_admin",
                         icon_custom_emoji_id=ICON_BACK,
-                        color_prefix="⬅️",
+                        style="danger",
                     )
                 ],
             ]
@@ -1532,7 +1548,7 @@ async def display_channel_controller(
                         text="Channels",
                         callback_data=f"channels_page_{scope}_{page}",
                         icon_custom_emoji_id=ICON_BACK,
-                        color_prefix="⬅️",
+                        style="danger",
                     )
                 ]
             ]
@@ -1582,7 +1598,7 @@ async def display_channel_controller(
 
 
 # ---------------------------------------------------------------------------
-# BUILT-IN PYTHON ASYNCIO HEALTHCHECK HTTP SERVER (NO EXTERNAL PACKAGES)
+# BUILT-IN PYTHON ASYNCIO HEALTHCHECK HTTP SERVER (NO EXTERNAL DEPENDENCIES)
 # ---------------------------------------------------------------------------
 
 
