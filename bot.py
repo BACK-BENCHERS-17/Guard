@@ -2,7 +2,7 @@
 """
 Telegram Channel Guard & Message Purge Bot
 Built for Python 3.10 - 3.14+ (Render / VPS Compatible)
-Complete Production Monolith
+Zero External Web Dependencies (Uses Built-in Asyncio HTTP Server)
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ except RuntimeError:
     asyncio.set_event_loop(loop)
 
 import aiosqlite
-from aiohttp import web
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ButtonStyle, ChatMemberStatus, ChatType
@@ -354,14 +353,6 @@ def is_admin(user_id: int) -> bool:
 async def check_channel_permissions(
     client: Client, channel_id: int
 ) -> Tuple[bool, bool, Dict[str, bool], str]:
-    """
-    STRICT 4-WAY REQUIRED PERMISSION CHECK:
-    The bot must possess ALL 4 of the following privileges:
-    1. can_post_messages (Post Messages)
-    2. can_edit_messages (Edit Messages)
-    3. can_delete_messages (Delete Messages)
-    4. can_invite_users (Add / Invite Users via Link)
-    """
     perms = {"post": False, "edit": False, "delete": False, "invite": False}
     try:
         member: ChatMember = await client.get_chat_member(channel_id, "me")
@@ -391,7 +382,6 @@ async def check_channel_permissions(
 
 
 async def can_user_manage_channel(client: Client, user_id: int, channel_id: int) -> bool:
-    """Live verification: Checks if the user is STILL a valid owner/admin right now."""
     if is_admin(user_id):
         return True
 
@@ -400,7 +390,6 @@ async def can_user_manage_channel(client: Client, user_id: int, channel_id: int)
         if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
             return True
         else:
-            # User was demoted or left; revoke ownership link in db
             ch = await db.get_channel(channel_id)
             if ch and ch["owner_id"] == user_id:
                 await db.set_channel_owner(channel_id, 0)
@@ -410,7 +399,6 @@ async def can_user_manage_channel(client: Client, user_id: int, channel_id: int)
 
 
 async def get_accessible_channels_for_user(client: Client, user_id: int) -> List[aiosqlite.Row]:
-    """Dynamically validates the user's admin standing in every channel."""
     all_channels = await db.get_all_channels()
     valid_channels = []
 
@@ -527,8 +515,6 @@ async def safe_edit_message(
 
 
 def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
-    # Telegram Native Add-to-Channel URL with 4 Required Admin Rights Pre-Selected
-    # post_messages + edit_messages + delete_messages + invite_users
     protect_url = (
         f"https://t.me/{BOT_USERNAME}?startchannel=true&admin=post_messages+edit_messages+delete_messages+invite_users"
     )
@@ -572,7 +558,6 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
         ],
     ]
 
-    # SYSTEM STATUS is strictly restricted to Owner / Superadmins
     if is_superadmin:
         rows.append(
             [
@@ -851,7 +836,6 @@ async def process_channel_message_deletion(client: Client, message: Message, eve
     if not channel_row or not channel_row["auto_delete_enabled"]:
         return
 
-    # Strict check: Post, Edit, Delete, and Invite must ALL be granted
     is_adm, has_all_four, perms, status_text = await check_channel_permissions(client, chat.id)
 
     if not is_adm or not has_all_four:
@@ -1002,7 +986,6 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
 
         if target_chat_id:
             try:
-                # Live validation of user's admin status in target channel
                 member = await client.get_chat_member(target_chat_id, user_id)
                 if member.status not in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR) and not is_admin(user_id):
                     await message.reply_text(f"{TG_CROSS} You are not an administrator in that channel.")
@@ -1127,7 +1110,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         return
 
     if data == "nav_how_it_works":
-        text = f"""┌────── ˹ {TG_DOC} <b>ʜᴏᴡ ɪᴛ ᴡᴏʀᴋs</b> ˼ ─── ⏤‌●
+        text = f"""┌────── ˹ {TG_DOC} <b>ʜᴏᴡ ɪᴛ ᴡᴏʀᴋs</b> ˼ ─── ⏤‌‌●
 ┆
 ┆ {TG_CHECK} <b>sᴛʀɪᴄᴛ 4-ᴡᴀʏ ᴘᴇʀᴍɪssɪᴏɴs:</b>
 ┆ The bot works ONLY if all 4 permissions are granted:
@@ -1307,10 +1290,8 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         scope = parts[3]
         page = int(parts[4])
 
-        # Live verification: Revoke instantly if demoted from channel admin
         if not await can_user_manage_channel(client, user_id, c_id):
             await query.answer("Access revoked: You are no longer an administrator in this channel.", show_alert=True)
-            # Re-render updated channel list
             channels = await get_accessible_channels_for_user(client, user_id)
             kb = build_channel_pagination_keyboard(channels, page=1, scope="my")
             await safe_edit_message(query, f"{TG_WARN} <b>Access Revoked. Updated channel list:</b>", reply_markup=kb)
@@ -1550,24 +1531,36 @@ async def display_channel_controller(
 
 
 # ---------------------------------------------------------------------------
-# WEB SERVER FOR RENDER.COM 24/7 HEALTH CHECKS
+# BUILT-IN PYTHON ASYNCIO HEALTHCHECK HTTP SERVER (NO AIOHTTP NEEDED)
 # ---------------------------------------------------------------------------
 
 
-async def handle_ping(request: web.Request) -> web.Response:
-    return web.Response(text="Channel Guard Active & Running OK", status=200)
+async def handle_http_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        await reader.read(1024)
+        body = b"OK - Channel Guard Bot is running 24/7"
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
-async def start_web_server() -> web.AppRunner:
-    web_app = web.Application()
-    web_app.router.add_get("/", handle_ping)
-    web_app.router.add_get("/health", handle_ping)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Render healthcheck server listening on port {PORT}")
-    return runner
+async def start_built_in_server() -> asyncio.AbstractServer:
+    server = await asyncio.start_server(handle_http_connection, "0.0.0.0", PORT)
+    logger.info(f"Built-in healthcheck webserver listening on port {PORT} for Render")
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -1580,7 +1573,7 @@ async def main() -> None:
     logger.info("Starting Telegram Channel Guard Bot...")
     await db.connect()
 
-    web_runner = await start_web_server()
+    server = await start_built_in_server()
 
     await app.start()
     me = await app.get_me()
@@ -1590,7 +1583,8 @@ async def main() -> None:
 
     await idle()
     await app.stop()
-    await web_runner.cleanup()
+    server.close()
+    await server.wait_closed()
     await db.close()
 
 
