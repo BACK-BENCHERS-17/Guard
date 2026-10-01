@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Telegram Channel Guard & Message Purge Bot
-Built for Kurigram / Modern Layer-supported Pyrogram Forks
-Native Colored Buttons (ButtonStyle) + Custom Emoji Icons + 24/7 Render Keep-Alive
+Built for Kurigram / Modern Pyrogram Forks
+100% MongoDB Persistence (Motor) + Native ButtonStyle Colors & Custom Emojis
+Render 24/7 Deployment Ready
 """
 
 from __future__ import annotations
@@ -17,15 +18,15 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Global event loop initialization
+# Global event loop initialization compatible with Python 3.12 - 3.14+
 try:
     loop = asyncio.get_event_loop()
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-import aiosqlite
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ButtonStyle, ChatMemberStatus, ChatType
 from pyrogram.errors import (
@@ -51,7 +52,7 @@ from pyrogram.types import (
 )
 
 # ---------------------------------------------------------------------------
-# CUSTOM PREMIUM EMOJI IDs (Numeric IDs for Icons & Text)
+# CUSTOM PREMIUM EMOJI IDs (Strict Numeric IDs)
 # ---------------------------------------------------------------------------
 ICON_CHECK = 5985596818912712352
 ICON_CROSS = 5985346521103604145
@@ -79,7 +80,7 @@ ICON_INBOX = 5776182936638329359
 ICON_PIN = 5796440171364749940
 ICON_USER = 5258011929993026890
 
-# Premium Text Tags (Telegram requires valid standard emoji inside tags for entity parsing)
+# Standard text tags for message bodies
 TG_CHECK = f'<tg-emoji emoji-id="{ICON_CHECK}">✅</tg-emoji>'
 TG_CROSS = f'<tg-emoji emoji-id="{ICON_CROSS}">❌</tg-emoji>'
 TG_WARN = f'<tg-emoji emoji-id="{ICON_WARN}">⚠️</tg-emoji>'
@@ -113,14 +114,17 @@ API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "channel_guard.db")
+MONGO_URI = os.getenv("MONGO_URI") or os.getenv("DATABASE_URL") or os.getenv("MONGODB_URI", "")
 BOT_NAME = os.getenv("BOT_NAME", "Channel Guard Pro")
-SUPPORT_URL = "https://t.me/BotXCore"
+SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/BotXCore")
 PORT = int(os.getenv("PORT", 8080))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 if not API_ID_RAW or not API_HASH or not BOT_TOKEN:
-    sys.exit("CRITICAL: Missing API_ID, API_HASH, or BOT_TOKEN in environment.")
+    sys.exit("CRITICAL: Missing API_ID, API_HASH, or BOT_TOKEN in environment variables.")
+
+if not MONGO_URI:
+    sys.exit("CRITICAL: Missing MONGO_URI in environment variables. Database connection required.")
 
 try:
     API_ID = int(API_ID_RAW)
@@ -167,157 +171,120 @@ CHANNELS_PER_PAGE = 5
 BOT_USERNAME: str = ""
 
 # ---------------------------------------------------------------------------
-# DATABASE SERVICE
+# MONGODB DATABASE ENGINE (MOTOR)
 # ---------------------------------------------------------------------------
 
 
-class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._conn: Optional[aiosqlite.Connection] = None
-        self._lock = asyncio.Lock()
+class MongoDatabase:
+    def __init__(self, uri: str):
+        self.uri = uri
+        self.client: Optional[AsyncIOMotorClient] = None
+        self.db = None
+        self.channels = None
+        self.users = None
+        self.logs = None
 
     async def connect(self) -> None:
-        self._conn = await aiosqlite.connect(self.db_path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._create_tables()
-        logger.info(f"Connected to database at {self.db_path}")
+        self.client = AsyncIOMotorClient(self.uri)
+        # Parse database name from URI or fallback to default
+        db_name = "channel_guard_db"
+        self.db = self.client.get_default_database(default=db_name)
+        self.channels = self.db["channels"]
+        self.users = self.db["users"]
+        self.logs = self.db["join_request_logs"]
+
+        # Ensure unique indexes
+        await self.channels.create_index("channel_id", unique=True)
+        await self.users.create_index("user_id", unique=True)
+        logger.info("MongoDB connection active and indexes confirmed.")
 
     async def close(self) -> None:
-        if self._conn:
-            await self._conn.close()
-
-    async def _create_tables(self) -> None:
-        async with self._lock:
-            await self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channels (
-                    channel_id INTEGER PRIMARY KEY,
-                    channel_username TEXT,
-                    channel_title TEXT NOT NULL,
-                    owner_id INTEGER DEFAULT 0,
-                    auto_delete_enabled INTEGER NOT NULL DEFAULT 1,
-                    delete_mode TEXT NOT NULL DEFAULT 'all',
-                    join_dm_enabled INTEGER NOT NULL DEFAULT 1,
-                    custom_join_text TEXT,
-                    buttons_json TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            try:
-                await self._conn.execute("ALTER TABLE channels ADD COLUMN owner_id INTEGER DEFAULT 0;")
-            except Exception:
-                pass
-
-            await self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            await self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS join_request_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    channel_id INTEGER NOT NULL,
-                    channel_title TEXT,
-                    dm_status TEXT NOT NULL,
-                    approved TEXT NOT NULL DEFAULT 'NO',
-                    error_reason TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            await self._conn.commit()
+        if self.client:
+            self.client.close()
+            logger.info("MongoDB connection closed.")
 
     async def register_user(self, user: User) -> None:
-        async with self._lock:
-            await self._conn.execute(
-                """
-                INSERT INTO users (user_id, username, first_name, last_name)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username = excluded.username,
-                    first_name = excluded.first_name,
-                    last_name = excluded.last_name;
-                """,
-                (user.id, user.username, user.first_name, user.last_name),
-            )
-            await self._conn.commit()
+        await self.users.update_one(
+            {"user_id": user.id},
+            {
+                "$set": {
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+            },
+            upsert=True,
+        )
 
-    async def get_all_users(self) -> List[aiosqlite.Row]:
-        async with self._lock:
-            async with self._conn.execute("SELECT user_id FROM users") as cur:
-                return await cur.fetchall()
+    async def get_all_users(self) -> List[Dict[str, Any]]:
+        cursor = self.users.find({}, {"_id": 0, "user_id": 1})
+        return await cursor.to_list(length=100000)
 
-    async def get_channel(self, channel_id: int) -> Optional[aiosqlite.Row]:
-        async with self._lock:
-            async with self._conn.execute(
-                "SELECT * FROM channels WHERE channel_id = ?", (channel_id,)
-            ) as cursor:
-                return await cursor.fetchone()
+    async def get_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
+        return await self.channels.find_one({"channel_id": channel_id}, {"_id": 0})
 
-    async def get_all_channels(self) -> List[aiosqlite.Row]:
-        async with self._lock:
-            async with self._conn.execute(
-                "SELECT * FROM channels ORDER BY channel_title ASC"
-            ) as cursor:
-                return await cursor.fetchall()
+    async def get_all_channels(self) -> List[Dict[str, Any]]:
+        cursor = self.channels.find({}, {"_id": 0}).sort("channel_title", 1)
+        return await cursor.to_list(length=10000)
 
     async def upsert_channel(
-        self, channel_id: int, title: str, username: Optional[str], owner_id: Optional[int] = None
+        self,
+        channel_id: int,
+        title: str,
+        username: Optional[str],
+        owner_id: Optional[int] = None,
     ) -> None:
-        async with self._lock:
-            if owner_id and owner_id != 0:
-                await self._conn.execute(
-                    """
-                    INSERT INTO channels (channel_id, channel_title, channel_username, owner_id, auto_delete_enabled, updated_at)
-                    VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
-                    ON CONFLICT(channel_id) DO UPDATE SET
-                        channel_title = excluded.channel_title,
-                        channel_username = excluded.channel_username,
-                        owner_id = CASE WHEN channels.owner_id = 0 THEN excluded.owner_id ELSE channels.owner_id END,
-                        updated_at = CURRENT_TIMESTAMP;
-                    """,
-                    (channel_id, title, username, owner_id),
-                )
-            else:
-                await self._conn.execute(
-                    """
-                    INSERT INTO channels (channel_id, channel_title, channel_username, auto_delete_enabled, updated_at)
-                    VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
-                    ON CONFLICT(channel_id) DO UPDATE SET
-                        channel_title = excluded.channel_title,
-                        channel_username = excluded.channel_username,
-                        updated_at = CURRENT_TIMESTAMP;
-                    """,
-                    (channel_id, title, username),
-                )
-            await self._conn.commit()
+        update_fields: Dict[str, Any] = {
+            "channel_title": title,
+            "channel_username": username,
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+        set_on_insert: Dict[str, Any] = {
+            "channel_id": channel_id,
+            "auto_delete_enabled": 1,
+            "delete_mode": "all",
+            "join_dm_enabled": 1,
+            "custom_join_text": None,
+            "buttons_json": None,
+            "created_at": datetime.now(timezone.utc),
+        }
+
+        if owner_id and owner_id != 0:
+            # Set owner if not previously set
+            update_fields["owner_id"] = owner_id
+        else:
+            set_on_insert["owner_id"] = 0
+
+        await self.channels.update_one(
+            {"channel_id": channel_id},
+            {"$set": update_fields, "$setOnInsert": set_on_insert},
+            upsert=True,
+        )
 
     async def set_channel_owner(self, channel_id: int, owner_id: int) -> None:
-        async with self._lock:
-            await self._conn.execute(
-                "UPDATE channels SET owner_id = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?",
-                (owner_id, channel_id),
-            )
-            await self._conn.commit()
+        await self.channels.update_one(
+            {"channel_id": channel_id},
+            {
+                "$set": {
+                    "owner_id": owner_id,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
 
     async def set_auto_delete(self, channel_id: int, enabled: bool) -> None:
-        async with self._lock:
-            await self._conn.execute(
-                "UPDATE channels SET auto_delete_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?",
-                (1 if enabled else 0, channel_id),
-            )
-            await self._conn.commit()
+        await self.channels.update_one(
+            {"channel_id": channel_id},
+            {
+                "$set": {
+                    "auto_delete_enabled": 1 if enabled else 0,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
 
     async def log_join_request(
         self,
@@ -328,18 +295,20 @@ class Database:
         approved: str = "NO",
         error_reason: Optional[str] = None,
     ) -> None:
-        async with self._lock:
-            await self._conn.execute(
-                """
-                INSERT INTO join_request_logs (user_id, channel_id, channel_title, dm_status, approved, error_reason)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, channel_id, channel_title, dm_status, approved, error_reason),
-            )
-            await self._conn.commit()
+        await self.logs.insert_one(
+            {
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "channel_title": channel_title,
+                "dm_status": dm_status,
+                "approved": approved,
+                "error_reason": error_reason,
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
 
 
-db = Database(DATABASE_PATH)
+db = MongoDatabase(MONGO_URI)
 
 # ---------------------------------------------------------------------------
 # PERMISSION AUDIT & ACCESS VERIFICATION
@@ -353,7 +322,7 @@ def is_admin(user_id: int) -> bool:
 async def check_channel_permissions(
     client: Client, channel_id: int
 ) -> Tuple[bool, bool, Dict[str, bool], str]:
-    """Strict check: Post, Edit, Delete, Invite."""
+    """Requires: can_post_messages, can_edit_messages, can_delete_messages, can_invite_users."""
     perms = {"post": False, "edit": False, "delete": False, "invite": False}
     try:
         member: ChatMember = await client.get_chat_member(channel_id, "me")
@@ -389,14 +358,14 @@ async def can_user_manage_channel(client: Client, user_id: int, channel_id: int)
             return True
         else:
             ch = await db.get_channel(channel_id)
-            if ch and ch["owner_id"] == user_id:
+            if ch and ch.get("owner_id") == user_id:
                 await db.set_channel_owner(channel_id, 0)
             return False
     except Exception:
         return False
 
 
-async def get_accessible_channels_for_user(client: Client, user_id: int) -> List[aiosqlite.Row]:
+async def get_accessible_channels_for_user(client: Client, user_id: int) -> List[Dict[str, Any]]:
     all_channels = await db.get_all_channels()
     valid_channels = []
 
@@ -405,10 +374,10 @@ async def get_accessible_channels_for_user(client: Client, user_id: int) -> List
             member = await client.get_chat_member(ch["channel_id"], user_id)
             if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
                 valid_channels.append(ch)
-                if ch["owner_id"] != user_id:
+                if ch.get("owner_id") != user_id:
                     await db.set_channel_owner(ch["channel_id"], user_id)
             else:
-                if ch["owner_id"] == user_id:
+                if ch.get("owner_id") == user_id:
                     await db.set_channel_owner(ch["channel_id"], 0)
         except Exception:
             continue
@@ -419,7 +388,7 @@ async def get_accessible_channels_for_user(client: Client, user_id: int) -> List
 def format_template(
     template: str,
     user: Optional[User] = None,
-    channel: Optional[Union[Chat, aiosqlite.Row]] = None,
+    channel: Optional[Union[Chat, Dict[str, Any]]] = None,
 ) -> str:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -433,14 +402,12 @@ def format_template(
         c_id = str(channel.id)
         c_name = html.escape(channel.title or "Channel")
         c_uname = f"@{channel.username}" if channel.username else "Private"
-    elif isinstance(channel, aiosqlite.Row) or (
-        channel and hasattr(channel, "__getitem__")
-    ):
-        c_id = str(channel["channel_id"])
-        c_name = html.escape(channel["channel_title"] or "Channel")
+    elif isinstance(channel, dict):
+        c_id = str(channel.get("channel_id", "-1000000000000"))
+        c_name = html.escape(channel.get("channel_title") or "Channel")
         c_uname = (
-            f"@{channel['channel_username']}"
-            if channel["channel_username"]
+            f"@{channel.get('channel_username')}"
+            if channel.get("channel_username")
             else "Private"
         )
     else:
@@ -487,7 +454,6 @@ def parse_buttons(raw_json: Optional[str]) -> Optional[InlineKeyboardMarkup]:
                             text=btn["text"],
                             url=btn["url"],
                             icon_custom_emoji_id=ICON_GLOBE,
-                            style=ButtonStyle.PRIMARY,
                         )
                     )
             if button_row:
@@ -509,7 +475,7 @@ async def safe_edit_message(
 
 
 # ---------------------------------------------------------------------------
-# INTERFACE KEYBOARDS (NATIVE STYLES + NO NORMAL TEXT EMOJIS)
+# INTERFACE KEYBOARDS (PURE TEXT LABELS + NATIVE BUTTONSTYLE + ICONS)
 # ---------------------------------------------------------------------------
 
 
@@ -544,7 +510,6 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
         ],
     ]
 
-    # System Status & Admin Suite: strictly Superadmin/Owner only
     if is_superadmin:
         rows.append(
             [
@@ -576,7 +541,6 @@ def get_home_keyboard(is_superadmin: bool = False) -> InlineKeyboardMarkup:
 
 
 def get_link_channel_menu_keyboard() -> InlineKeyboardMarkup:
-    """One-Click Protect Channel URL Button inside the Link Channel screen."""
     protect_url = (
         f"https://t.me/{BOT_USERNAME}?startchannel=true&admin=post_messages+edit_messages+delete_messages+invite_users"
     )
@@ -602,7 +566,7 @@ def get_link_channel_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_channel_pagination_keyboard(
-    channels: List[aiosqlite.Row], page: int, scope: str
+    channels: List[Dict[str, Any]], page: int, scope: str
 ) -> InlineKeyboardMarkup:
     total_channels = len(channels)
     total_pages = max(1, (total_channels + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE)
@@ -625,7 +589,6 @@ def build_channel_pagination_keyboard(
             ]
         )
 
-    # Clean Pagination Buttons Row
     nav_row: List[InlineKeyboardButton] = []
     if page > 1:
         nav_row.append(
@@ -682,14 +645,14 @@ def get_channel_management_panel(
             text="Auto-Delete: ON",
             callback_data=f"toggle_ad_off_{channel_id}_{scope}_{page}",
             icon_custom_emoji_id=ICON_CHECK,
-            style=ButtonStyle.SUCCESS,  # Green
+            style=ButtonStyle.SUCCESS,
         )
     else:
         ad_btn = InlineKeyboardButton(
             text="Auto-Delete: OFF",
             callback_data=f"toggle_ad_on_{channel_id}_{scope}_{page}",
             icon_custom_emoji_id=ICON_CROSS,
-            style=ButtonStyle.DANGER,  # Red
+            style=ButtonStyle.DANGER,
         )
 
     return InlineKeyboardMarkup(
@@ -700,7 +663,7 @@ def get_channel_management_panel(
                     text="Refresh Status",
                     callback_data=f"view_channel_{channel_id}_{scope}_{page}",
                     icon_custom_emoji_id=ICON_REFRESH,
-                    style=ButtonStyle.PRIMARY,  # Blue
+                    style=ButtonStyle.PRIMARY,
                 ),
                 InlineKeyboardButton(
                     text="Channel List",
@@ -803,8 +766,8 @@ async def on_join_request(client: Client, request: ChatJoinRequest) -> None:
 
     channel_row = await db.get_channel(chat.id)
     join_dm_enabled = (
-        bool(channel_row["join_dm_enabled"])
-        if channel_row and "join_dm_enabled" in channel_row.keys()
+        bool(channel_row.get("join_dm_enabled"))
+        if channel_row and "join_dm_enabled" in channel_row
         else True
     )
 
@@ -812,12 +775,14 @@ async def on_join_request(client: Client, request: ChatJoinRequest) -> None:
         return
 
     template = (
-        channel_row["custom_join_text"]
-        if channel_row and channel_row["custom_join_text"]
+        channel_row.get("custom_join_text")
+        if channel_row and channel_row.get("custom_join_text")
         else DEFAULT_JOIN_REQUEST_TEXT
     )
     formatted_dm = format_template(template, user=user, channel=chat)
-    keyboard = parse_buttons(channel_row["buttons_json"] or DEFAULT_BUTTONS_JSON)
+    keyboard = parse_buttons(
+        channel_row.get("buttons_json") if channel_row else DEFAULT_BUTTONS_JSON
+    )
 
     try:
         await client.send_message(
@@ -840,16 +805,19 @@ async def on_join_request(client: Client, request: ChatJoinRequest) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def process_channel_message_deletion(client: Client, message: Message, event_type: str = "POST") -> None:
+async def process_channel_message_deletion(
+    client: Client, message: Message, event_type: str = "POST"
+) -> None:
     chat: Chat = message.chat
 
     sender_id = message.from_user.id if message.from_user else 0
     await db.upsert_channel(chat.id, chat.title, chat.username, owner_id=sender_id if sender_id else None)
 
     channel_row = await db.get_channel(chat.id)
-    if not channel_row or not channel_row["auto_delete_enabled"]:
+    if not channel_row or not channel_row.get("auto_delete_enabled"):
         return
 
+    # Check strict 4 rights (Post, Edit, Delete, Invite)
     is_adm, has_all_four, perms, status_text = await check_channel_permissions(client, chat.id)
 
     if not is_adm or not has_all_four:
@@ -864,7 +832,9 @@ async def process_channel_message_deletion(client: Client, message: Message, eve
         await message.delete()
         logger.info(f"[AUTO_DELETE] Purged {event_type} {message.id} from '{chat.title}'")
     except MessageDeleteForbidden:
-        logger.warning(f"[AUTO_DELETE] Forbidden: Cannot delete {event_type} {message.id} in channel {chat.id}")
+        logger.warning(
+            f"[AUTO_DELETE] Forbidden: Cannot delete {event_type} {message.id} in channel {chat.id}"
+        )
     except FloodWait as flood:
         await asyncio.sleep(flood.value)
         try:
@@ -1006,7 +976,12 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
                     USER_STATES.pop(user_id, None)
                     return
 
-                await db.upsert_channel(target_chat_id, target_chat_title or "Channel", target_chat_username, owner_id=user_id)
+                await db.upsert_channel(
+                    target_chat_id,
+                    target_chat_title or "Channel",
+                    target_chat_username,
+                    owner_id=user_id,
+                )
                 await db.set_channel_owner(target_chat_id, user_id)
 
                 await message.reply_text(
@@ -1088,7 +1063,6 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         await query.answer()
         return
 
-    # Link Channel Menu: Protect Channel button is placed cleanly inside here
     if data == "prompt_add_channel":
         USER_STATES[user_id] = {"action": "manual_add_channel"}
         instructions = f"""┌────── ˹ {TG_KEY} <b>ʟɪɴᴋ ᴄʜᴀɴɴᴇʟ</b> ˼ ─── ⏤‌●
@@ -1247,7 +1221,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         await query.answer()
         return
 
-    # System Status - strictly Owner / Superadmin only
+    # System Status (Superadmin/Owner only)
     if data == "nav_status":
         if not is_admin(user_id):
             await query.answer("Access denied.", show_alert=True)
@@ -1259,7 +1233,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         report = (
             f"┌────── ˹ {TG_STATS} <b>sʏsᴛᴇᴍ ᴀᴜᴅɪᴛ</b> ˼ ─── ⏤‌●\n"
             f"┆\n"
-            f"┆ {TG_WIFI} ᴅᴀᴛᴀʙᴀsᴇ : {TG_CHECK} ᴏɴʟɪɴᴇ\n"
+            f"┆ {TG_WIFI} ᴅᴀᴛᴀʙᴀsᴇ : {TG_CHECK} ᴏɴʟɪɴᴇ (ᴍᴏɴɢᴏᴅʙ)\n"
             f"┆ {TG_SHIELD} ᴘʀᴏᴛᴇᴄᴛᴇᴅ ᴄʜᴀɴɴᴇʟs : <b>{len(channels)}</b>\n"
             f"┆ {TG_USERS} ʀᴇɢɪsᴛᴇʀᴇᴅ ᴜsᴇʀs : <b>{len(all_users)}</b>\n"
             f"┆\n"
@@ -1271,7 +1245,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             e_icon = TG_CHECK if perms["edit"] else TG_CROSS
             d_icon = TG_CHECK if perms["delete"] else TG_CROSS
             i_icon = TG_CHECK if perms["invite"] else TG_CROSS
-            ad_icon = TG_CHECK if ch["auto_delete_enabled"] else TG_CROSS
+            ad_icon = TG_CHECK if ch.get("auto_delete_enabled") else TG_CROSS
 
             report += f"┆ <b>{html.escape(ch['channel_title'])}:</b> [{p_icon}{e_icon}{d_icon}{i_icon}] | Purge: {ad_icon}\n"
 
@@ -1307,7 +1281,6 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         scope = parts[3]
         page = int(parts[4])
 
-        # Live verification: Revoke instantly if demoted from channel admin
         if not await can_user_manage_channel(client, user_id, c_id):
             await query.answer("Access revoked: You are no longer an administrator in this channel.", show_alert=True)
             channels = await get_accessible_channels_for_user(client, user_id)
@@ -1518,8 +1491,8 @@ async def display_channel_controller(
 
     panel_text = f"""┌────── ˹ {TG_HAMMER} <b>ᴄʜᴀɴɴᴇʟ ᴄᴏɴᴛʀᴏʟ</b> ˼ ─── ⏤‌●
 ┆
-┆ {TG_DOC} <b>ᴄʜᴀɴɴᴇʟ :</b> {html.escape(ch['channel_title'])}
-┆ {TG_KEY} <b>ɪᴅ :</b> <code>{ch['channel_id']}</code>
+┆ {TG_DOC} <b>ᴄʜᴀɴɴᴇʟ :</b> {html.escape(ch.get('channel_title', 'Channel'))}
+┆ {TG_KEY} <b>ɪᴅ :</b> <code>{ch.get('channel_id')}</code>
 ┆
 ┆ {TG_CHECK} <b>ʙᴏᴛ sᴛᴀᴛᴜs :</b> {bot_badge}
 ┆ {TG_SHIELD} <b>ɢᴜᴀʀᴅ sᴛᴀᴛᴜs :</b> {overall_guard}
@@ -1530,7 +1503,7 @@ async def display_channel_controller(
 ┆ • {d_badge}
 ┆ • {i_badge}
 ┆
-┆ {TG_DIAMOND} <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ :</b> {'ENABLED' if ch['auto_delete_enabled'] else 'DISABLED'}
+┆ {TG_DIAMOND} <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ :</b> {'ENABLED' if ch.get('auto_delete_enabled') else 'DISABLED'}
 ┆
 ┆ <i>{status_note}</i>
 ┆
@@ -1541,7 +1514,7 @@ async def display_channel_controller(
         panel_text,
         reply_markup=get_channel_management_panel(
             channel_id=channel_id,
-            auto_delete=bool(ch["auto_delete_enabled"]),
+            auto_delete=bool(ch.get("auto_delete_enabled")),
             scope=scope,
             page=page,
         ),
@@ -1556,7 +1529,7 @@ async def display_channel_controller(
 async def handle_http_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         await reader.read(1024)
-        body = b"OK - Channel Guard Bot is running 24/7"
+        body = b"OK - Channel Guard Bot is running 24/7 with MongoDB"
         response = (
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/plain; charset=utf-8\r\n"
@@ -1577,7 +1550,7 @@ async def handle_http_connection(reader: asyncio.StreamReader, writer: asyncio.S
 
 async def start_built_in_server() -> asyncio.AbstractServer:
     server = await asyncio.start_server(handle_http_connection, "0.0.0.0", PORT)
-    logger.info(f"Built-in healthcheck webserver listening on port {PORT} for Render")
+    logger.info(f"Built-in healthcheck webserver listening on port {PORT} for Render.")
     return server
 
 
@@ -1588,7 +1561,7 @@ async def start_built_in_server() -> asyncio.AbstractServer:
 
 async def main() -> None:
     global BOT_USERNAME
-    logger.info("Starting Telegram Channel Guard Bot...")
+    logger.info("Starting Telegram Channel Guard Bot (MongoDB)...")
     await db.connect()
 
     server = await start_built_in_server()
