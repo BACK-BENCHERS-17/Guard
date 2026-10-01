@@ -2,7 +2,7 @@
 """
 Telegram Channel Guard & Message Purge Bot
 Built for Kurigram / Modern Pyrogram Forks
-100% MongoDB Persistence (Motor) + Native ButtonStyle Colors & Custom Emojis
+100% MongoDB Persistence (Motor) + Bulletproof Zero-Drop Broadcast Engine
 Render 24/7 Deployment Ready
 """
 
@@ -186,14 +186,12 @@ class MongoDatabase:
 
     async def connect(self) -> None:
         self.client = AsyncIOMotorClient(self.uri)
-        # Parse database name from URI or fallback to default
         db_name = "channel_guard_db"
         self.db = self.client.get_default_database(default=db_name)
         self.channels = self.db["channels"]
         self.users = self.db["users"]
         self.logs = self.db["join_request_logs"]
 
-        # Ensure unique indexes
         await self.channels.create_index("channel_id", unique=True)
         await self.users.create_index("user_id", unique=True)
         logger.info("MongoDB connection active and indexes confirmed.")
@@ -211,6 +209,7 @@ class MongoDatabase:
                     "username": user.username,
                     "first_name": user.first_name,
                     "last_name": user.last_name,
+                    "is_blocked": False,
                     "updated_at": datetime.now(timezone.utc),
                 },
                 "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
@@ -218,9 +217,21 @@ class MongoDatabase:
             upsert=True,
         )
 
-    async def get_all_users(self) -> List[Dict[str, Any]]:
-        cursor = self.users.find({}, {"_id": 0, "user_id": 1})
-        return await cursor.to_list(length=100000)
+    async def mark_user_blocked(self, user_id: int) -> None:
+        """Mark user as blocked so future broadcast won't waste time on them."""
+        await self.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"is_blocked": True, "updated_at": datetime.now(timezone.utc)}}
+        )
+
+    async def delete_deactivated_user(self, user_id: int) -> None:
+        """Remove completely deleted/deactivated accounts from DB."""
+        await self.users.delete_one({"user_id": user_id})
+
+    async def get_all_users(self, active_only: bool = True) -> List[Dict[str, Any]]:
+        query = {"is_blocked": False} if active_only else {}
+        cursor = self.users.find(query, {"_id": 0, "user_id": 1})
+        return await cursor.to_list(length=1000000)
 
     async def get_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
         return await self.channels.find_one({"channel_id": channel_id}, {"_id": 0})
@@ -253,7 +264,6 @@ class MongoDatabase:
         }
 
         if owner_id and owner_id != 0:
-            # Set owner if not previously set
             update_fields["owner_id"] = owner_id
         else:
             set_on_insert["owner_id"] = 0
@@ -748,7 +758,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    sleep_threshold=10,
+    sleep_threshold=60,
 )
 
 # ---------------------------------------------------------------------------
@@ -794,6 +804,7 @@ async def on_join_request(client: Client, request: ChatJoinRequest) -> None:
         await db.log_join_request(user.id, chat.id, chat.title, "SUCCESS", "NO", None)
     except UserIsBlocked:
         logger.warning(f"[JOIN_REQUEST] User {user.id} blocked the bot. Skipped.")
+        await db.mark_user_blocked(user.id)
         await db.log_join_request(user.id, chat.id, chat.title, "FAILED", "NO", "USER_IS_BLOCKED")
     except Exception as exc:
         logger.error(f"[JOIN_REQUEST] DM delivery failure for {user.id}: {exc}")
@@ -903,33 +914,79 @@ async def cmd_admin_handler(client: Client, message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FORWARDED CHANNEL LINKING & BROADCAST DELIVERY
+# BULLETPROOF ZERO-DROP BROADCAST DISPATCHER
 # ---------------------------------------------------------------------------
 
 
-async def deliver_message(
-    client: Client, target_id: int, message: Message, pin: bool = False, forward: bool = False
-) -> bool:
-    try:
-        if forward:
-            sent_msg = await message.forward(target_id)
-        else:
-            sent_msg = await client.copy_message(
-                chat_id=target_id,
-                from_chat_id=message.chat.id,
-                message_id=message.id,
-            )
-        if pin:
+async def deliver_broadcast_item(
+    client: Client,
+    target_id: int,
+    message: Message,
+    pin: bool = False,
+    forward: bool = False,
+    max_retries: int = 5,
+) -> Tuple[bool, str]:
+    """
+    Guarantees message delivery without dropping active users.
+    Handles FloodWait dynamically and cleans up dead accounts.
+    Returns: (is_success, status_category)
+    status_category in: ["SUCCESS", "BLOCKED", "DEACTIVATED", "FAILED"]
+    """
+    for attempt in range(max_retries):
+        try:
+            if forward:
+                sent_msg = await message.forward(target_id)
+            else:
+                sent_msg = await client.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                )
+
+            if pin:
+                try:
+                    await sent_msg.pin(both_sides=True)
+                except Exception:
+                    pass
+
+            return True, "SUCCESS"
+
+        except FloodWait as flood:
+            wait_time = int(flood.value) + 2
+            logger.warning(f"Broadcast FloodWait: sleeping {wait_time}s on target {target_id}")
+            await asyncio.sleep(wait_time)
+            continue  # Retry after sleeping
+
+        except UserIsBlocked:
+            await db.mark_user_blocked(target_id)
+            return False, "BLOCKED"
+
+        except InputUserDeactivated:
+            await db.delete_deactivated_user(target_id)
+            return False, "DEACTIVATED"
+
+        except (PeerIdInvalid, ChannelInvalid):
+            # Try to resolve peer if local cache expired
             try:
-                await sent_msg.pin(both_sides=True)
+                await client.get_chat(target_id)
+                await asyncio.sleep(0.5)
+                continue
             except Exception:
-                pass
-        return True
-    except FloodWait as flood:
-        await asyncio.sleep(flood.value)
-        return await deliver_message(client, target_id, message, pin, forward)
-    except Exception:
-        return False
+                return False, "FAILED"
+
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "blocked" in err_str or "user is blocked" in err_str:
+                await db.mark_user_blocked(target_id)
+                return False, "BLOCKED"
+            if "deactivated" in err_str:
+                await db.delete_deactivated_user(target_id)
+                return False, "DEACTIVATED"
+
+            logger.error(f"Broadcast error on target {target_id} (attempt {attempt + 1}): {exc}")
+            await asyncio.sleep(1.0)
+
+    return False, "FAILED"
 
 
 @app.on_message(filters.private & ~filters.command(["start", "admin"]))
@@ -1010,36 +1067,90 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
             "broadcast_global": "Users + Channels",
         }[action]
 
-        status_msg = await message.reply(f"{TG_SPARKLE} Dispatching broadcast to {targets_desc}...")
-        sent, failed = 0, 0
-
-        target_ids = []
+        target_ids: List[int] = []
         if action in ("broadcast_channels", "broadcast_global"):
             channels = await db.get_all_channels()
             target_ids.extend([ch["channel_id"] for ch in channels])
 
         if action in ("broadcast_users", "broadcast_global"):
-            users = await db.get_all_users()
+            users = await db.get_all_users(active_only=False)
             target_ids.extend([u["user_id"] for u in users])
 
-        for target_id in set(target_ids):
-            ok = await deliver_message(client, target_id, message, pin_it, fwd_it)
-            if ok:
+        # Remove duplicates while preserving order
+        unique_targets: List[int] = list(dict.fromkeys(target_ids))
+        total_targets = len(unique_targets)
+
+        if total_targets == 0:
+            await message.reply_text(f"{TG_WARN} No target IDs found to broadcast.")
+            del USER_STATES[user_id]
+            return
+
+        status_msg = await message.reply(
+            f"{TG_SPARKLE} <b>Starting broadcast to {total_targets} {targets_desc}...</b>\n"
+            f"<i>Zero-drop engine active with adaptive rate limiting.</i>"
+        )
+
+        sent, blocked, deactivated, failed = 0, 0, 0, 0
+        last_edit_time = asyncio.get_event_loop().time()
+
+        for index, target_id in enumerate(unique_targets, start=1):
+            success, reason = await deliver_broadcast_item(
+                client,
+                target_id=target_id,
+                message=message,
+                pin=pin_it,
+                forward=fwd_it,
+            )
+
+            if success:
                 sent += 1
+            elif reason == "BLOCKED":
+                blocked += 1
+            elif reason == "DEACTIVATED":
+                deactivated += 1
             else:
                 failed += 1
-            await asyncio.sleep(0.15)
+
+            # Update status message every 5 items or every 4 seconds
+            now_time = asyncio.get_event_loop().time()
+            if (index % 5 == 0 or index == total_targets) and (now_time - last_edit_time > 3.5):
+                try:
+                    await status_msg.edit_text(
+                        f"┌────── ˹ {TG_SPARKLE} <b>ʙʀᴏᴀᴅᴄᴀsᴛɪɴɢ...</b> ˼ ─── ⏤‌●\n"
+                        f"┆\n"
+                        f"┆ {TG_DIAMOND} ᴛᴀʀɢᴇᴛ : <b>{targets_desc}</b>\n"
+                        f"┆ {TG_STATS} ᴘʀᴏɢʀᴇss : <b>{index}/{total_targets}</b>\n"
+                        f"┆ {TG_CHECK} sᴜᴄᴄᴇss : <b>{sent}</b>\n"
+                        f"┆ {TG_CROSS} ʙʟᴏᴄᴋᴇᴅ : <b>{blocked}</b>\n"
+                        f"┆ {TG_WARN} ғᴀɪʟᴇᴅ : <b>{failed}</b>\n"
+                        f"┆\n"
+                        f"└──────────────────●"
+                    )
+                    last_edit_time = now_time
+                except Exception:
+                    pass
+
+            # Safe pace between messages to avoid Telegram flood penalties
+            await asyncio.sleep(0.35)
 
         del USER_STATES[user_id]
-        await status_msg.edit_text(
+
+        final_summary = (
             f"┌────── ˹ {TG_CHECK} <b>ʙʀᴏᴀᴅᴄᴀsᴛ ᴅᴏɴᴇ</b> ˼ ─── ⏤‌●\n"
             f"┆\n"
             f"┆ {TG_DIAMOND} ᴛᴀʀɢᴇᴛ : <b>{targets_desc}</b>\n"
+            f"┆ {TG_STATS} ᴛᴏᴛᴀʟ : <b>{total_targets}</b>\n"
             f"┆ {TG_CHECK} ᴅᴇʟɪᴠᴇʀᴇᴅ : <b>{sent}</b>\n"
-            f"┆ {TG_CROSS} ғᴀɪʟᴇᴅ : <b>{failed}</b>\n"
-            f"┆\n"
-            f"└──────────────────●"
         )
+        if blocked > 0:
+            final_summary += f"┆ {TG_CROSS} ʙᴏᴛ ʙʟᴏᴄᴋᴇᴅ : <b>{blocked}</b>\n"
+        if deactivated > 0:
+            final_summary += f"┆ {TG_WARN} ᴅᴇʟᴇᴛᴇᴅ ᴀᴄᴄs : <b>{deactivated}</b>\n"
+        if failed > 0:
+            final_summary += f"┆ {TG_CROSS} ғᴀɪʟᴇᴅ (ɪɴᴠᴀʟɪᴅ) : <b>{failed}</b>\n"
+
+        final_summary += "┆\n└──────────────────●"
+        await status_msg.edit_text(final_summary)
 
 
 # ---------------------------------------------------------------------------
@@ -1228,14 +1339,16 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             return
 
         channels = await db.get_all_channels()
-        all_users = await db.get_all_users()
+        all_users = await db.get_all_users(active_only=False)
+        active_users = [u for u in all_users if not u.get("is_blocked")]
 
         report = (
             f"┌────── ˹ {TG_STATS} <b>sʏsᴛᴇᴍ ᴀᴜᴅɪᴛ</b> ˼ ─── ⏤‌●\n"
             f"┆\n"
             f"┆ {TG_WIFI} ᴅᴀᴛᴀʙᴀsᴇ : {TG_CHECK} ᴏɴʟɪɴᴇ (ᴍᴏɴɢᴏᴅʙ)\n"
             f"┆ {TG_SHIELD} ᴘʀᴏᴛᴇᴄᴛᴇᴅ ᴄʜᴀɴɴᴇʟs : <b>{len(channels)}</b>\n"
-            f"┆ {TG_USERS} ʀᴇɢɪsᴛᴇʀᴇᴅ ᴜsᴇʀs : <b>{len(all_users)}</b>\n"
+            f"┆ {TG_USERS} ᴛᴏᴛᴀʟ ᴜsᴇʀs : <b>{len(all_users)}</b>\n"
+            f"┆ {TG_CHECK} ᴀᴄᴛɪᴠᴇ ᴜsᴇʀs : <b>{len(active_users)}</b>\n"
             f"┆\n"
             f"┆ <b>ᴄʜᴀɴɴᴇʟ ʜᴇᴀʟᴛʜ [P / E / D / I]:</b>\n"
         )
