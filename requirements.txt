@@ -1,4 +1,4 @@
 kurigram
 tgcrypto
-aiosqlite
+motor
 python-dotenv
