@@ -201,7 +201,7 @@ class MongoDatabase:
             self.client.close()
             logger.info("MongoDB connection closed.")
 
-    async def register_user(self, user: User) -> None:
+    async def register_user(self, user: User, source: str = "direct") -> None:
         await self.users.update_one(
             {"user_id": user.id},
             {
@@ -210,6 +210,7 @@ class MongoDatabase:
                     "first_name": user.first_name,
                     "last_name": user.last_name,
                     "is_blocked": False,
+                    "last_source": source,
                     "updated_at": datetime.now(timezone.utc),
                 },
                 "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
@@ -218,19 +219,17 @@ class MongoDatabase:
         )
 
     async def mark_user_blocked(self, user_id: int) -> None:
-        """Mark user as blocked so future broadcast won't waste time on them."""
         await self.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_blocked": True, "updated_at": datetime.now(timezone.utc)}}
         )
 
     async def delete_deactivated_user(self, user_id: int) -> None:
-        """Remove completely deleted/deactivated accounts from DB."""
         await self.users.delete_one({"user_id": user_id})
 
     async def get_all_users(self, active_only: bool = True) -> List[Dict[str, Any]]:
         query = {"is_blocked": False} if active_only else {}
-        cursor = self.users.find(query, {"_id": 0, "user_id": 1})
+        cursor = self.users.find(query, {"_id": 0, "user_id": 1, "username": 1})
         return await cursor.to_list(length=1000000)
 
     async def get_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
@@ -771,7 +770,8 @@ async def on_join_request(client: Client, request: ChatJoinRequest) -> None:
     user: User = request.from_user
     chat: Chat = request.chat
 
-    await db.register_user(user)
+    # Register with source tag
+    await db.register_user(user, source="join_request")
     await db.upsert_channel(chat.id, chat.title, chat.username)
 
     channel_row = await db.get_channel(chat.id)
@@ -874,7 +874,7 @@ async def on_channel_edited_message(client: Client, message: Message) -> None:
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start_handler(client: Client, message: Message) -> None:
     user: User = message.from_user
-    await db.register_user(user)
+    await db.register_user(user, source="start_command")
 
     is_super = is_admin(user.id)
     welcome_text = f"""┌────── ˹ {TG_SHIELD} <b>{html.escape(BOT_NAME)}</b> ˼ ─── ⏤‌●
@@ -914,7 +914,7 @@ async def cmd_admin_handler(client: Client, message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# BULLETPROOF ZERO-DROP BROADCAST DISPATCHER
+# ZERO-DROP BROADCAST ENGINE (RESOLVES PEERS & SUPPORTS JOIN-REQUEST USERS)
 # ---------------------------------------------------------------------------
 
 
@@ -924,13 +924,12 @@ async def deliver_broadcast_item(
     message: Message,
     pin: bool = False,
     forward: bool = False,
-    max_retries: int = 5,
+    username: Optional[str] = None,
+    max_retries: int = 4,
 ) -> Tuple[bool, str]:
     """
-    Guarantees message delivery without dropping active users.
-    Handles FloodWait dynamically and cleans up dead accounts.
-    Returns: (is_success, status_category)
-    status_category in: ["SUCCESS", "BLOCKED", "DEACTIVATED", "FAILED"]
+    Delivers broadcast to both standard users and join-request users.
+    Falls back to resolving peer/username and direct text delivery if copy fails.
     """
     for attempt in range(max_retries):
         try:
@@ -955,7 +954,7 @@ async def deliver_broadcast_item(
             wait_time = int(flood.value) + 2
             logger.warning(f"Broadcast FloodWait: sleeping {wait_time}s on target {target_id}")
             await asyncio.sleep(wait_time)
-            continue  # Retry after sleeping
+            continue
 
         except UserIsBlocked:
             await db.mark_user_blocked(target_id)
@@ -966,17 +965,52 @@ async def deliver_broadcast_item(
             return False, "DEACTIVATED"
 
         except (PeerIdInvalid, ChannelInvalid):
-            # Try to resolve peer if local cache expired
+            # Peer cache miss: Resolve peer via MTProto or Username
+            resolved = False
             try:
-                await client.get_chat(target_id)
+                if username:
+                    await client.get_users(username)
+                    resolved = True
+                else:
+                    await client.get_users(target_id)
+                    resolved = True
+            except Exception:
+                pass
+
+            if resolved:
                 await asyncio.sleep(0.5)
                 continue
-            except Exception:
-                return False, "FAILED"
+
+            # Fallback for Join-Request users without private chat history
+            try:
+                if message.text:
+                    await client.send_message(
+                        chat_id=target_id,
+                        text=message.text.html,
+                        disable_web_page_preview=True,
+                    )
+                    return True, "SUCCESS"
+                elif message.photo:
+                    await client.send_photo(
+                        chat_id=target_id,
+                        photo=message.photo.file_id,
+                        caption=message.caption.html if message.caption else None,
+                    )
+                    return True, "SUCCESS"
+            except Exception as direct_exc:
+                err_s = str(direct_exc).lower()
+                if "blocked" in err_s:
+                    await db.mark_user_blocked(target_id)
+                    return False, "BLOCKED"
+                if "deactivated" in err_s:
+                    await db.delete_deactivated_user(target_id)
+                    return False, "DEACTIVATED"
+
+            return False, "FAILED"
 
         except Exception as exc:
             err_str = str(exc).lower()
-            if "blocked" in err_str or "user is blocked" in err_str:
+            if "blocked" in err_str:
                 await db.mark_user_blocked(target_id)
                 return False, "BLOCKED"
             if "deactivated" in err_str:
@@ -984,7 +1018,7 @@ async def deliver_broadcast_item(
                 return False, "DEACTIVATED"
 
             logger.error(f"Broadcast error on target {target_id} (attempt {attempt + 1}): {exc}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.8)
 
     return False, "FAILED"
 
@@ -1067,17 +1101,26 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
             "broadcast_global": "Users + Channels",
         }[action]
 
-        target_ids: List[int] = []
+        target_data: List[Dict[str, Any]] = []
+
         if action in ("broadcast_channels", "broadcast_global"):
             channels = await db.get_all_channels()
-            target_ids.extend([ch["channel_id"] for ch in channels])
+            for ch in channels:
+                target_data.append({"id": ch["channel_id"], "username": ch.get("channel_username")})
 
         if action in ("broadcast_users", "broadcast_global"):
             users = await db.get_all_users(active_only=False)
-            target_ids.extend([u["user_id"] for u in users])
+            for u in users:
+                target_data.append({"id": u["user_id"], "username": u.get("username")})
 
-        # Remove duplicates while preserving order
-        unique_targets: List[int] = list(dict.fromkeys(target_ids))
+        # Deduplicate while preserving order
+        unique_targets: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for item in target_data:
+            if item["id"] not in seen_ids:
+                seen_ids.add(item["id"])
+                unique_targets.append(item)
+
         total_targets = len(unique_targets)
 
         if total_targets == 0:
@@ -1087,19 +1130,23 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
 
         status_msg = await message.reply(
             f"{TG_SPARKLE} <b>Starting broadcast to {total_targets} {targets_desc}...</b>\n"
-            f"<i>Zero-drop engine active with adaptive rate limiting.</i>"
+            f"<i>Zero-drop engine active with adaptive peer resolving.</i>"
         )
 
         sent, blocked, deactivated, failed = 0, 0, 0, 0
         last_edit_time = asyncio.get_event_loop().time()
 
-        for index, target_id in enumerate(unique_targets, start=1):
+        for index, item in enumerate(unique_targets, start=1):
+            t_id = item["id"]
+            u_name = item.get("username")
+
             success, reason = await deliver_broadcast_item(
                 client,
-                target_id=target_id,
+                target_id=t_id,
                 message=message,
                 pin=pin_it,
                 forward=fwd_it,
+                username=u_name,
             )
 
             if success:
@@ -1111,7 +1158,6 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
             else:
                 failed += 1
 
-            # Update status message every 5 items or every 4 seconds
             now_time = asyncio.get_event_loop().time()
             if (index % 5 == 0 or index == total_targets) and (now_time - last_edit_time > 3.5):
                 try:
@@ -1130,7 +1176,6 @@ async def on_private_interactive_input(client: Client, message: Message) -> None
                 except Exception:
                     pass
 
-            # Safe pace between messages to avoid Telegram flood penalties
             await asyncio.sleep(0.35)
 
         del USER_STATES[user_id]
